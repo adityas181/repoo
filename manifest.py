@@ -35,6 +35,17 @@ def _save_manifest(path: Path, data: dict) -> None:
     )
 
 
+_ENV_TO_NUMERIC = {"dev": 0, "uat": 1, "prod": 2}
+
+
+def _normalize_env(environment: str) -> int:
+    """Convert env name to numeric code (dev→0, uat→1, prod→2). Pass-through if already numeric."""
+    val = environment.lower()
+    if val in _ENV_TO_NUMERIC:
+        return _ENV_TO_NUMERIC[val]
+    return int(val)
+
+
 def add_manifest_entry(
     *,
     agent_id: str,
@@ -53,11 +64,12 @@ def add_manifest_entry(
             logger.debug(f"[MANIFEST] Entry for {deployment_id} already exists, skipping add.")
             return
 
+        env_code = _normalize_env(environment)
         deployments.append({
             "agent_id": agent_id,
             "agent_name": agent_name,
             "version_number": version_number,
-            "environment": environment,
+            "environment": env_code,
             "deployment_id": deployment_id,
         })
         updated = {"agents": deployments}
