@@ -317,6 +317,7 @@ async def simple_run_agent(
     event_manager: EventManager | None = None,
     prod_deployment: AgentDeploymentProd | None = None,
     uat_deployment: AgentDeploymentUAT | None = None,
+    skip_node_persist: bool = False,
 ):
     validate_input_and_tweaks(input_request)
     try:
@@ -351,6 +352,12 @@ async def simple_run_agent(
             graph.uat_deployment_id = str(uat_deployment.id)
             graph.uat_org_id = str(uat_deployment.org_id) if uat_deployment.org_id else None
             graph.uat_dept_id = str(uat_deployment.dept_id) if uat_deployment.dept_id else None
+
+        # When called internally from orchestrator, skip node-level conversation persistence.
+        # The orchestrator handles its own saving to orch_conversation.
+        if skip_node_persist:
+            graph.skip_dev_logging = True
+            graph.orch_skip_node_persist = True
 
         inputs = None
         if input_request.input_value is not None:
@@ -458,6 +465,7 @@ async def run_agent_generator(
     client_consumed_queue: asyncio.Queue,
     prod_deployment: AgentDeploymentProd | None = None,
     uat_deployment: AgentDeploymentUAT | None = None,
+    skip_node_persist: bool = False,
 ) -> None:
     """Executes a agent asynchronously and manages event streaming to the client.
 
@@ -485,6 +493,7 @@ async def run_agent_generator(
         - On error, logs the error and sends it via event_manager.on_error()
         - Always sends a final None event to signal completion
     """
+    _gen_start = time.perf_counter()
     try:
         result = await simple_run_agent(
             agent=agent,
@@ -494,11 +503,16 @@ async def run_agent_generator(
             event_manager=event_manager,
             prod_deployment=prod_deployment,
             uat_deployment=uat_deployment,
+            skip_node_persist=skip_node_persist,
         )
         event_manager.on_end(data={"result": result.model_dump()})
+        from agentcore.observability.metrics_registry import record_agent_run
+        record_agent_run(agent.name or "unknown", "success", (time.perf_counter() - _gen_start) * 1000)
         await client_consumed_queue.get()
     except (ValueError, InvalidChatInputError, SerializationError) as e:
         logger.error(f"Error running agent: {e}")
+        from agentcore.observability.metrics_registry import record_agent_run
+        record_agent_run(agent.name or "unknown", "error", (time.perf_counter() - _gen_start) * 1000)
         event_manager.on_error(data={"error": str(e)})
     finally:
         await event_manager.queue.put((None, None, time.time))
@@ -507,6 +521,7 @@ async def run_agent_generator(
 @router.post("/run/{agent_id_or_name}", response_model=None, response_model_exclude_none=True)
 async def simplified_run_agent(
     *,
+    request: Request,
     agent_id_or_name: str,
     response: Response,
     background_tasks: BackgroundTasks,
@@ -595,11 +610,24 @@ async def simplified_run_agent(
         else uat_deployment.id if uat_deployment
         else None
     )
-    auto_generated_key = await _enforce_agent_api_key(agent_api_key, agent.id, env, deployment_id, version)
-    if auto_generated_key:
-        response.headers["X-Generated-Api-Key"] = auto_generated_key
+    # Skip API key enforcement for trusted internal calls (e.g. from orchestrator).
+    # The secret must match AGENTCORE_INTERNAL_SECRET env var; if unset, bypass never activates.
+    _internal_secret = os.environ.get("AGENTCORE_INTERNAL_SECRET", "")
+    _is_internal = bool(
+        _internal_secret
+        and request.headers.get("X-Internal-Secret") == _internal_secret
+    )
+    if not _is_internal:
+        auto_generated_key = await _enforce_agent_api_key(agent_api_key, agent.id, env, deployment_id, version)
+        if auto_generated_key:
+            response.headers["X-Generated-Api-Key"] = auto_generated_key
 
     start_time = time.perf_counter()
+    from agentcore.observability.metrics_registry import (
+        record_agent_run, adjust_active_sessions, record_session_duration,
+    )
+    _agent_name = agent.name if agent else "unknown"
+    adjust_active_sessions(1)
 
     if stream:
         asyncio_queue: asyncio.Queue = asyncio.Queue()
@@ -631,6 +659,8 @@ async def simplified_run_agent(
 
             async def on_disconnect_rmq() -> None:
                 logger.debug("Client disconnected, cleaning up RabbitMQ run job")
+                adjust_active_sessions(-1)
+                record_session_duration((time.perf_counter() - start_time) * 1000)
                 await queue_service.cleanup_job(job_id)
 
             return StreamingResponse(
@@ -649,11 +679,14 @@ async def simplified_run_agent(
                 client_consumed_queue=asyncio_queue_client_consumed,
                 prod_deployment=prod_deployment,
                 uat_deployment=uat_deployment,
+                skip_node_persist=_is_internal,
             )
         )
 
         async def on_disconnect() -> None:
             logger.debug("Client disconnected, closing tasks")
+            adjust_active_sessions(-1)
+            record_session_duration((time.perf_counter() - start_time) * 1000)
             main_task.cancel()
 
         return StreamingResponse(
@@ -720,6 +753,7 @@ async def simplified_run_agent(
                         run_error_message="",
                     ),
                 )
+                record_agent_run(_agent_name, "success", (end_time - start_time) * 1000)
                 from agentcore.api.v1_schemas import RunResponse
                 return RunResponse(**result_data)
 
@@ -735,10 +769,13 @@ async def simplified_run_agent(
                     run_error_message=str(exc),
                 ),
             )
+            record_agent_run(_agent_name, "error", (time.perf_counter() - start_time) * 1000)
             if isinstance(exc, ValueError):
                 raise APIException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, exception=exc, agent=agent) from exc
             raise
         finally:
+            adjust_active_sessions(-1)
+            record_session_duration((time.perf_counter() - start_time) * 1000)
             # Cleanup the queue
             queue_service._queues.pop(job_id, None)
 
@@ -751,6 +788,7 @@ async def simplified_run_agent(
             api_key_user=None,  # Disabled for testing
             prod_deployment=prod_deployment,
             uat_deployment=uat_deployment,
+            skip_node_persist=_is_internal,
         )
         end_time = time.perf_counter()
         background_tasks.add_task(
@@ -761,6 +799,9 @@ async def simplified_run_agent(
                 run_error_message="",
             ),
         )
+        record_agent_run(_agent_name, "success", (end_time - start_time) * 1000)
+        adjust_active_sessions(-1)
+        record_session_duration((end_time - start_time) * 1000)
 
     except ValueError as exc:
         background_tasks.add_task(
@@ -771,12 +812,18 @@ async def simplified_run_agent(
                 run_error_message=str(exc),
             ),
         )
+        record_agent_run(_agent_name, "error", (time.perf_counter() - start_time) * 1000)
+        adjust_active_sessions(-1)
+        record_session_duration((time.perf_counter() - start_time) * 1000)
         if "badly formed hexadecimal UUID string" in str(exc):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         if "not found" in str(exc):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
         raise APIException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, exception=exc, agent=agent) from exc
     except InvalidChatInputError as exc:
+        record_agent_run(_agent_name, "error", (time.perf_counter() - start_time) * 1000)
+        adjust_active_sessions(-1)
+        record_session_duration((time.perf_counter() - start_time) * 1000)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except Exception as exc:
         background_tasks.add_task(
@@ -787,6 +834,9 @@ async def simplified_run_agent(
                 run_error_message=str(exc),
             ),
         )
+        record_agent_run(_agent_name, "error", (time.perf_counter() - start_time) * 1000)
+        adjust_active_sessions(-1)
+        record_session_duration((time.perf_counter() - start_time) * 1000)
         raise APIException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, exception=exc, agent=agent) from exc
 
     return result
