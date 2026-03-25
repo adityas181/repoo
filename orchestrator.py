@@ -980,6 +980,8 @@ async def orch_chat_stream(
             "is_prod_deployment": dep_is_prod,
             "project_id": orch_project_id,
             "project_name": orch_project_name,
+            "env": "prod" if dep_is_prod else "uat",
+            "version": f"v{deployment.version_number}",
         }
         await rabbitmq_service.publish_orchestrator_job(job_data)
         logger.info(f"Orchestrator job {job_id} published to RabbitMQ")
