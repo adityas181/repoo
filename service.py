@@ -92,14 +92,33 @@ class RabbitMQService(Service):
             # Separate publisher channel — no QoS, no consumers
             self._publish_channel = await self._connection.channel()
 
+            # --- FIX: Orchestrator queue consumer only runs on the main backend ---
+            # When an agent is published, a copy of this backend is deployed as an
+            # AKS pod. That pod has AGENTCORE_AGENT_ID set in its environment.
+            # The main backend (AGENTCORE_AGENT_ID is empty) publishes orchestrator
+            # jobs AND consumes them. The pod must NOT consume them — it doesn't have
+            # the job_id registered in its memory, so it would always discard them as
+            # stale, and the main backend would never get the message back.
+            import os as _os
+            is_agent_pod = bool(_os.environ.get("AGENTCORE_AGENT_ID", "").strip())
+            # is_agent_pod = True  → running inside an AKS published-agent pod
+            # is_agent_pod = False → running as the main backend
+
             # All queues with their consumer handlers
             queue_consumers = [
                 (self.config.build_queue, self._on_build_message),
                 (self.config.run_queue, self._on_run_message),
                 (self.config.schedule_queue, self._on_schedule_message),
                 (self.config.trigger_queue, self._on_trigger_message),
-                (self.config.orchestrator_queue, self._on_orchestrator_message),
+                # orchestrator queue added below only for the main backend
             ]
+            if not is_agent_pod:
+                # Main backend: subscribe to orchestrator queue so it can coordinate
+                # agent calls and stream responses back to the user
+                queue_consumers.append((self.config.orchestrator_queue, self._on_orchestrator_message))
+            else:
+                # AKS pod: skip orchestrator queue — pod only serves /api/run/ HTTP calls
+                logger.info("Running as published agent pod — skipping orchestrator queue consumer")
 
             for queue_name, handler in queue_consumers:
                 # Delete and redeclare — purge() only removes READY messages but
