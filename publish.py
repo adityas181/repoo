@@ -37,6 +37,7 @@ from agentcore.services.database.models.user_department_membership.model import 
 from agentcore.services.database.models.user_organization_membership.model import UserOrganizationMembership
 from agentcore.services.database.models.agent.model import Agent, LifecycleStatusEnum
 from agentcore.services.database.models.department.model import Department
+from agentcore.services.database.models.role.model import Role
 from agentcore.services.database.models.approval_request.model import (
     ApprovalRequest,
 )
@@ -76,6 +77,28 @@ router = APIRouter(prefix="/publish", tags=["Publish"])
 
 # Roles that can publish directly to PROD (others go through approval flow)
 ADMIN_ROLES = {"admin", "super_admin", "root", "department_admin"}
+
+
+async def _resolve_super_admin_user_id(
+    *,
+    session: DbSession,
+    org_id: UUID | None,
+) -> UUID | None:
+    if not org_id:
+        return None
+    stmt = (
+        select(User)
+        .join(UserOrganizationMembership, UserOrganizationMembership.user_id == User.id)
+        .join(Role, Role.id == UserOrganizationMembership.role_id)
+        .where(
+            UserOrganizationMembership.org_id == org_id,
+            UserOrganizationMembership.status == "active",
+            func.lower(Role.name) == "super_admin",
+        )
+        .order_by(User.create_at.asc())
+    )
+    rows = (await session.exec(stmt)).all()
+    return rows[0].id if rows else None
 
 
 async def _validate_resources_for_prod(snapshot: dict, session) -> None:
@@ -2681,6 +2704,19 @@ async def publish_agent(
                     title=f'Agent "{published_agent_name}" awaiting your approval.',
                     link="/approval",
                 )
+                super_admin_id = await _resolve_super_admin_user_id(
+                    session=session,
+                    org_id=agent.org_id,
+                )
+                if super_admin_id and super_admin_id != resolved_department_admin_id:
+                    await upsert_approval_notification(
+                        session,
+                        recipient_user_id=super_admin_id,
+                        entity_type="agent_publish_request",
+                        entity_id=str(approval.id),
+                        title=f'Agent "{published_agent_name}" awaiting your approval.',
+                        link="/approval",
+                    )
 
                 # Link approval back to deployment record
                 new_record.approval_id = approval.id

@@ -1213,6 +1213,19 @@ async def promote_uat_to_prod(
                 title=f'Agent "{new_record.agent_name}" awaiting your approval.',
                 link="/approval",
             )
+            super_admin_id = await _resolve_super_admin_user_id(
+                session=session,
+                org_id=uat_dep.org_id,
+            )
+            if super_admin_id and super_admin_id != department.admin_user_id:
+                await upsert_approval_notification(
+                    session,
+                    recipient_user_id=super_admin_id,
+                    entity_type="agent_publish_request",
+                    entity_id=str(approval.id),
+                    title=f'Agent "{new_record.agent_name}" awaiting your approval.',
+                    link="/approval",
+                )
             new_record.approval_id = approval.id
             session.add(new_record)
 
