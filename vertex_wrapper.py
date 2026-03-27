@@ -360,6 +360,10 @@ class LangGraphVertex:
         # Create a copy of params to modify
         resolved_params = self.params.copy()
 
+        # Track which (source_id, field_name) pairs have already been resolved
+        # to avoid duplicating values when _resolve_vertex_dependencies already handled an edge
+        resolved_sources: set[tuple[str, str]] = set()
+
         # Look at incoming edges to find what parameters need to be resolved
         for edge_data in self.graph.edges:
             # Only process edges targeting this vertex
@@ -417,6 +421,12 @@ class LangGraphVertex:
                 )
                 continue
 
+            # Skip if this exact (source, field) was already resolved to avoid duplication
+            source_key = (source_id, field_name)
+            if source_key in resolved_sources:
+                continue
+            resolved_sources.add(source_key)
+
             # Check if input definition expects a list
             is_list_input = False
             for input_def in self.template.get('inputs', []) if isinstance(self.template, dict) else []:
@@ -448,11 +458,13 @@ class LangGraphVertex:
             )
 
             if isinstance(current_value, list):
-                # Append to existing list
-                if isinstance(result_value, list):
-                    resolved_params[field_name] = current_value + result_value
-                else:
-                    resolved_params[field_name] = current_value + [result_value]
+                # Append to existing list, but skip items already present (by identity)
+                # to avoid duplication when _resolve_vertex_dependencies already added them
+                new_items = result_value if isinstance(result_value, list) else [result_value]
+                existing_ids = {id(item) for item in current_value}
+                to_add = [item for item in new_items if id(item) not in existing_ids]
+                if to_add:
+                    resolved_params[field_name] = current_value + to_add
             elif current_value is None or current_value == "" or current_value == []:
                 # Set value (wrap in list if the field expects a list)
                 if is_list_input and not isinstance(result_value, list):
@@ -463,12 +475,12 @@ class LangGraphVertex:
                 # Current value is a string reference or other non-list value
                 # Replace with proper value, wrapping in list if field expects a list
                 if is_list_input:
-                    # Accumulate: keep existing value and add new one
+                    # Accumulate: keep existing value and add new one, dedup by identity
                     existing = [current_value] if not isinstance(current_value, list) else current_value
-                    if isinstance(result_value, list):
-                        resolved_params[field_name] = existing + result_value
-                    else:
-                        resolved_params[field_name] = existing + [result_value]
+                    new_items = result_value if isinstance(result_value, list) else [result_value]
+                    existing_ids = {id(item) for item in existing}
+                    to_add = [item for item in new_items if id(item) not in existing_ids]
+                    resolved_params[field_name] = existing + to_add
                 else:
                     resolved_params[field_name] = result_value
 
