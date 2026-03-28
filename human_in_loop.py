@@ -570,6 +570,9 @@ async def _forward_resume_via_run_api(
         "X-Internal-Secret": secret,
         "Content-Type": "application/json",
         "X-Orch-User-Id": str(current_user.id),
+        # Some ingress/proxies may drop unknown query params.
+        # Send thread id via header as a resilient fallback.
+        "X-HITL-Resume-Thread-Id": thread_id,
     }
     payload = {
         "session_id": hitl_req.session_id or thread_id,

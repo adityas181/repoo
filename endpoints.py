@@ -274,7 +274,7 @@ async def _run_hitl_resume_via_run_api(
         HITLResumeRequest,
         HITLStatus,
     )
-
+    logger.info(f"[RUN_AGENT] HITL resume requested")
     if not input_request.hitl_action:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -739,6 +739,7 @@ async def simplified_run_agent(
         else uat_deployment.id if uat_deployment
         else None
     )
+    logger.info(f"[RUN_AGENT] Enforcing API key for env={env.value} deployment_id={deployment_id}")
     # Skip API key enforcement for trusted internal calls (e.g. from orchestrator).
     # The secret must match AGENTCORE_INTERNAL_SECRET env var; if unset, bypass never activates.
     _internal_secret = os.environ.get("AGENTCORE_INTERNAL_SECRET", "")
@@ -756,10 +757,24 @@ async def simplified_run_agent(
     _orch_dept_id = request.headers.get("X-Orch-Dept-Id") if _trust_orch_headers else None
     _orch_user_id = request.headers.get("X-Orch-User-Id") if _trust_orch_headers else None
 
+    logger.info(f"[RUN_AGENT] Orchestrator context: deployment_id={_orch_deployment_id}, session_id={_orch_session_id}")
+    # Resilient fallback for environments where ingress/proxy strips unknown
+    # query params: accept HITL resume thread id from header too.
+    
+    if not hitl_resume_thread_id:
+        hitl_resume_thread_id = request.headers.get("X-HITL-Resume-Thread-Id")
+    logger.info(f"[RUN_AGENT] Checking for HITL resume thread id in query params and headers {hitl_resume_thread_id}")
+    if hitl_resume_thread_id:
+        logger.info(
+            f"[RUN_AGENT] HITL resume marker received: thread_id={hitl_resume_thread_id!r}, "
+            f"source={'query' if request.query_params.get('hitl_resume_thread_id') else 'header'}"
+        )
+
     # Internal-only resume mode for HITL.
     # This allows backend HITL approve to reuse /api/run routing (agent_id/env/version)
     # so the request reaches the correct agent pod.
     if hitl_resume_thread_id:
+        logger.info(f"[RUN_AGENT] HITL resume requested for thread_id={hitl_resume_thread_id!r}")
         if not _is_internal:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -786,6 +801,7 @@ async def simplified_run_agent(
     adjust_active_sessions(1)
 
     if stream:
+        logger.info(f"[RUN_AGENT] Starting streaming response for agent")
         asyncio_queue: asyncio.Queue = asyncio.Queue()
         asyncio_queue_client_consumed: asyncio.Queue = asyncio.Queue()
         event_manager = create_stream_tokens_event_manager(queue=asyncio_queue)
