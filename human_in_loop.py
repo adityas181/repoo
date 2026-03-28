@@ -300,12 +300,18 @@ async def resume_hitl(
 
         base_url = os.environ.get("ORCHESTRATOR_BASE_URL", "")
         if base_url:
-            use_run_resume = str(os.environ.get("HITL_RESUME_VIA_RUN_API", "false")).lower() in {
+            hitl_resume_flag_raw = str(os.environ.get("HITL_RESUME_VIA_RUN_API", "false"))
+            use_run_resume = hitl_resume_flag_raw.lower() in {
                 "1",
                 "true",
                 "yes",
                 "on",
             }
+            logger.info(
+                f"[HITL] Resume routing config — HITL_RESUME_VIA_RUN_API={hitl_resume_flag_raw!r}, "
+                f"parsed_use_run_resume={use_run_resume}, "
+                f"has_orchestrator_base_url={bool(base_url)}"
+            )
             if use_run_resume:
                 return await _forward_resume_via_run_api(
                     base_url=base_url,
@@ -461,6 +467,47 @@ async def _resolve_hitl_run_target(
                 return "2", f"v{prod_dep.version_number}"
         except Exception as exc:
             logger.warning(f"[HITL] Could not resolve deployment target for resume: {exc}")
+
+    # Fallback for older rows where interrupt_data missed deployment metadata:
+    # infer deployment_id from orchestrator conversation entries for this
+    # session/agent and then resolve env/version from deployment tables.
+    if hitl_req.session_id:
+        try:
+            from sqlmodel import col, select
+            from agentcore.services.database.models.orch_conversation.model import (
+                OrchConversationTable,
+            )
+            from agentcore.services.database.models.agent_deployment_uat.model import (
+                AgentDeploymentUAT,
+            )
+            from agentcore.services.database.models.agent_deployment_prod.model import (
+                AgentDeploymentProd,
+            )
+
+            dep_stmt = (
+                select(OrchConversationTable.deployment_id)
+                .where(OrchConversationTable.session_id == hitl_req.session_id)
+                .where(OrchConversationTable.agent_id == hitl_req.agent_id)
+                .where(OrchConversationTable.deployment_id.is_not(None))
+                .order_by(col(OrchConversationTable.timestamp).desc())
+                .limit(1)
+            )
+            dep_row = (await session.exec(dep_stmt)).first()
+            dep_from_conversation = None
+            if dep_row is not None:
+                dep_from_conversation = dep_row[0] if isinstance(dep_row, tuple) else dep_row
+
+            if dep_from_conversation:
+                dep_uuid = UUID(str(dep_from_conversation))
+                uat_dep = await session.get(AgentDeploymentUAT, dep_uuid)
+                if uat_dep:
+                    return "1", f"v{uat_dep.version_number}"
+
+                prod_dep = await session.get(AgentDeploymentProd, dep_uuid)
+                if prod_dep:
+                    return "2", f"v{prod_dep.version_number}"
+        except Exception as exc:
+            logger.warning(f"[HITL] Could not infer deployment target from orch conversation: {exc}")
 
     if not hitl_req.is_deployed_run:
         return "0", "v1"
