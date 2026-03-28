@@ -434,6 +434,12 @@ async def _resolve_hitl_run_target(
     session: Any,
 ) -> tuple[str, str] | None:
     """Resolve env/version for HITL resume via /api/run routing."""
+    def _log_target(source: str, env_code: str, version: str) -> None:
+        env_name = {"0": "dev", "1": "uat", "2": "prod"}.get(env_code, f"unknown({env_code})")
+        logger.info(
+            f"[HITL] Resolved resume target from {source}: env={env_name} ({env_code}), version={version}"
+        )
+
     interrupt_data = hitl_req.interrupt_data or {}
     deploy_meta = interrupt_data.get("_deploy_meta") or {}
 
@@ -442,6 +448,7 @@ async def _resolve_hitl_run_target(
     if env_code in {"0", "1", "2"} and version:
         if not version.startswith("v"):
             version = f"v{version}"
+        _log_target("interrupt_data._deploy_meta", env_code, version)
         return env_code, version
 
     deployment_id = (
@@ -460,11 +467,15 @@ async def _resolve_hitl_run_target(
 
             uat_dep = await session.get(AgentDeploymentUAT, dep_uuid)
             if uat_dep:
-                return "1", f"v{uat_dep.version_number}"
+                resolved = ("1", f"v{uat_dep.version_number}")
+                _log_target("interrupt_data deployment_id -> UAT table", resolved[0], resolved[1])
+                return resolved
 
             prod_dep = await session.get(AgentDeploymentProd, dep_uuid)
             if prod_dep:
-                return "2", f"v{prod_dep.version_number}"
+                resolved = ("2", f"v{prod_dep.version_number}")
+                _log_target("interrupt_data deployment_id -> PROD table", resolved[0], resolved[1])
+                return resolved
         except Exception as exc:
             logger.warning(f"[HITL] Could not resolve deployment target for resume: {exc}")
 
@@ -501,15 +512,20 @@ async def _resolve_hitl_run_target(
                 dep_uuid = UUID(str(dep_from_conversation))
                 uat_dep = await session.get(AgentDeploymentUAT, dep_uuid)
                 if uat_dep:
-                    return "1", f"v{uat_dep.version_number}"
+                    resolved = ("1", f"v{uat_dep.version_number}")
+                    _log_target("orch_conversation deployment_id -> UAT table", resolved[0], resolved[1])
+                    return resolved
 
                 prod_dep = await session.get(AgentDeploymentProd, dep_uuid)
                 if prod_dep:
-                    return "2", f"v{prod_dep.version_number}"
+                    resolved = ("2", f"v{prod_dep.version_number}")
+                    _log_target("orch_conversation deployment_id -> PROD table", resolved[0], resolved[1])
+                    return resolved
         except Exception as exc:
             logger.warning(f"[HITL] Could not infer deployment target from orch conversation: {exc}")
 
     if not hitl_req.is_deployed_run:
+        _log_target("non-deployed fallback", "0", "v1")
         return "0", "v1"
 
     return None
