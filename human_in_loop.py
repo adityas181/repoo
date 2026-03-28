@@ -23,7 +23,12 @@ from langgraph.types import Command
 from loguru import logger
 from sqlmodel import col, select
 
-from agentcore.api.utils import CurrentActiveUser, DbSession, build_graph_from_db_no_cache
+from agentcore.api.utils import (
+    CurrentActiveUser,
+    DbSession,
+    build_graph_from_data,
+    build_graph_from_db_no_cache,
+)
 from agentcore.graph_langgraph.checkpointer import get_checkpointer
 from agentcore.services.database.models.agent.model import Agent
 from agentcore.services.database.models.hitl_request.model import (
@@ -239,8 +244,10 @@ async def resume_hitl(
 ) -> dict[str, Any]:
     """Resume a paused graph run with the human's decision.
 
-    On the backend pod (no AGENTCORE_IS_POD), this forwards the resume to the
-    agent pod via ORCHESTRATOR_BASE_URL so the graph executes on the agent pod.
+    On the backend pod (no AGENTCORE_IS_POD):
+    - playground/non-deployed runs execute locally on backend
+    - deployed/published runs are forwarded via ORCHESTRATOR_BASE_URL
+      so execution stays on routed agent pod context.
     On the agent pod (AGENTCORE_IS_POD=true), or when called internally, this
     executes the graph locally.
 
@@ -251,9 +258,15 @@ async def resume_hitl(
     """
     hitl_req = await _get_pending_request(thread_id, session)
     _check_hitl_authorization(hitl_req, current_user)
-    await _require_hitl_permission(
-        current_user, _permission_for_hitl_action(body.action)
-    )
+    if not _is_playground_owner(hitl_req, current_user):
+        await _require_hitl_permission(
+            current_user, _permission_for_hitl_action(body.action)
+        )
+    else:
+        logger.info(
+            f"[HITL] Playground owner bypass for thread_id={thread_id!r}, "
+            f"user_id={current_user.id}, action={body.action!r}"
+        )
 
     if hitl_req.status != HITLStatus.PENDING:
         raise HTTPException(
@@ -270,8 +283,40 @@ async def resume_hitl(
     )
 
     if not _is_agent_pod and not _is_internal:
+        # Playground/non-deployed runs should resume on backend pod.
+        # Only deployed/published runs are forwarded through orchestrator routing.
+        if not hitl_req.is_deployed_run:
+            logger.info(
+                f"[HITL] Playground run for thread_id={thread_id!r} — "
+                "executing resume locally on backend pod"
+            )
+            return await _execute_resume_locally(
+                thread_id=thread_id,
+                body=body,
+                hitl_req=hitl_req,
+                current_user=current_user,
+                session=session,
+            )
+
         base_url = os.environ.get("ORCHESTRATOR_BASE_URL", "")
         if base_url:
+            use_run_resume = str(os.environ.get("HITL_RESUME_VIA_RUN_API", "false")).lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            if use_run_resume:
+                return await _forward_resume_via_run_api(
+                    base_url=base_url,
+                    secret=_internal_secret,
+                    thread_id=thread_id,
+                    body=body,
+                    hitl_req=hitl_req,
+                    current_user=current_user,
+                    session=session,
+                    request=request,
+                )
             return await _forward_resume_to_agent_pod(
                 base_url=base_url,
                 secret=_internal_secret,
@@ -280,6 +325,7 @@ async def resume_hitl(
                 hitl_req=hitl_req,
                 current_user=current_user,
                 session=session,
+                request=request,
             )
         logger.warning(
             "[HITL] ORCHESTRATOR_BASE_URL not set — running resume locally on backend pod"
@@ -304,6 +350,7 @@ async def _forward_resume_to_agent_pod(
     hitl_req: HITLRequest,
     current_user: Any,
     session: Any,
+    request: Request | None = None,
 ) -> dict[str, Any]:
     """Forward the HITL resume request to the agent pod via HTTP."""
     url = f"{base_url}/api/v1/hitl/{thread_id}/resume"
@@ -311,6 +358,10 @@ async def _forward_resume_to_agent_pod(
         "X-Internal-Secret": secret,
         "Content-Type": "application/json",
     }
+    if request:
+        auth_header = request.headers.get("Authorization")
+        if auth_header:
+            headers["Authorization"] = auth_header
     payload = body.model_dump()
     logger.info(f"[HITL] Forwarding resume to agent pod: {url}")
 
@@ -371,6 +422,144 @@ async def _forward_resume_to_agent_pod(
         ) from exc
 
 
+async def _resolve_hitl_run_target(
+    *,
+    hitl_req: HITLRequest,
+    session: Any,
+) -> tuple[str, str] | None:
+    """Resolve env/version for HITL resume via /api/run routing."""
+    interrupt_data = hitl_req.interrupt_data or {}
+    deploy_meta = interrupt_data.get("_deploy_meta") or {}
+
+    env_code = str(deploy_meta.get("env") or "").strip()
+    version = str(deploy_meta.get("version") or "").strip()
+    if env_code in {"0", "1", "2"} and version:
+        if not version.startswith("v"):
+            version = f"v{version}"
+        return env_code, version
+
+    deployment_id = (
+        deploy_meta.get("deployment_id")
+        or (interrupt_data.get("_orch_meta") or {}).get("deployment_id")
+    )
+    if deployment_id:
+        try:
+            dep_uuid = UUID(str(deployment_id))
+            from agentcore.services.database.models.agent_deployment_uat.model import (
+                AgentDeploymentUAT,
+            )
+            from agentcore.services.database.models.agent_deployment_prod.model import (
+                AgentDeploymentProd,
+            )
+
+            uat_dep = await session.get(AgentDeploymentUAT, dep_uuid)
+            if uat_dep:
+                return "1", f"v{uat_dep.version_number}"
+
+            prod_dep = await session.get(AgentDeploymentProd, dep_uuid)
+            if prod_dep:
+                return "2", f"v{prod_dep.version_number}"
+        except Exception as exc:
+            logger.warning(f"[HITL] Could not resolve deployment target for resume: {exc}")
+
+    if not hitl_req.is_deployed_run:
+        return "0", "v1"
+
+    return None
+
+
+async def _forward_resume_via_run_api(
+    *,
+    base_url: str,
+    secret: str,
+    thread_id: str,
+    body: HITLResumeRequest,
+    hitl_req: HITLRequest,
+    current_user: Any,
+    session: Any,
+    request: Request,
+) -> dict[str, Any]:
+    """Forward HITL resume through /api/run to reuse existing pod routing."""
+    target = await _resolve_hitl_run_target(hitl_req=hitl_req, session=session)
+    if not target:
+        logger.warning(
+            f"[HITL] Could not resolve env/version for thread_id={thread_id!r}; "
+            "falling back to legacy /api/v1/hitl forward path"
+        )
+        return await _forward_resume_to_agent_pod(
+            base_url=base_url,
+            secret=secret,
+            thread_id=thread_id,
+            body=body,
+            hitl_req=hitl_req,
+            current_user=current_user,
+            session=session,
+            request=request,
+        )
+
+    env_code, version = target
+    url = (
+        f"{base_url}/api/run/{hitl_req.agent_id}"
+        f"?env={env_code}&version={version}&stream=false"
+        f"&hitl_resume_thread_id={thread_id}"
+    )
+    headers = {
+        "X-Internal-Secret": secret,
+        "Content-Type": "application/json",
+        "X-Orch-User-Id": str(current_user.id),
+    }
+    payload = {
+        "session_id": hitl_req.session_id or thread_id,
+        "hitl_action": body.action,
+        "hitl_feedback": body.feedback or "",
+        "hitl_edited_value": body.edited_value or "",
+    }
+    logger.info(f"[HITL] Forwarding resume via /api/run: {url}")
+
+    try:
+        async with httpx.AsyncClient(timeout=300, verify=False) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+
+        if resp.status_code != 200:
+            logger.error(
+                f"[HITL] /api/run resume failed: status={resp.status_code}, "
+                f"body={resp.text[:500]}"
+            )
+            raise HTTPException(
+                status_code=resp.status_code,
+                detail=f"/api/run resume failed: {resp.text[:500]}",
+            )
+
+        result = resp.json()
+        if not isinstance(result, dict) or result.get("status") not in {"completed", "interrupted"}:
+            logger.warning(
+                f"[HITL] /api/run returned non-resume payload for thread_id={thread_id!r}; "
+                "falling back to legacy /api/v1/hitl forward path"
+            )
+            return await _forward_resume_to_agent_pod(
+                base_url=base_url,
+                secret=secret,
+                thread_id=thread_id,
+                body=body,
+                hitl_req=hitl_req,
+                current_user=current_user,
+                session=session,
+                request=request,
+            )
+        logger.info(
+            f"[HITL] /api/run resume completed for thread_id={thread_id!r}: "
+            f"status={result.get('status')}"
+        )
+        await session.refresh(hitl_req)
+        return result
+    except httpx.HTTPError as exc:
+        logger.exception(f"[HITL] Failed to forward /api/run resume: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Failed to reach agent pod for HITL resume: {exc}",
+        ) from exc
+
+
 async def _execute_resume_locally(
     *,
     thread_id: str,
@@ -378,6 +567,8 @@ async def _execute_resume_locally(
     hitl_req: HITLRequest,
     current_user: Any,
     session: Any,
+    agent_payload: dict | None = None,
+    agent_name: str | None = None,
 ) -> dict[str, Any]:
     """Execute the HITL resume locally (on the agent pod or fallback)."""
     decision = {
@@ -388,12 +579,23 @@ async def _execute_resume_locally(
 
     try:
         # Rebuild the LangGraph compiled app for this agent.
-        graph = await build_graph_from_db_no_cache(
-            agent_id=hitl_req.agent_id,
-            session=session,
-            user_id=str(current_user.id),
-            session_id=hitl_req.session_id or thread_id,
-        )
+        # When agent_payload is provided (e.g. /api/run env/version snapshot),
+        # prefer it so resume stays on the exact deployed version.
+        if agent_payload is not None:
+            graph = await build_graph_from_data(
+                agent_id=str(hitl_req.agent_id),
+                payload=agent_payload,
+                agent_name=agent_name or "Agent",
+                user_id=str(current_user.id),
+                session_id=hitl_req.session_id or thread_id,
+            )
+        else:
+            graph = await build_graph_from_db_no_cache(
+                agent_id=hitl_req.agent_id,
+                session=session,
+                user_id=str(current_user.id),
+                session_id=hitl_req.session_id or thread_id,
+            )
 
         lg_config = {"configurable": {"thread_id": thread_id}}
 
@@ -643,7 +845,13 @@ async def cancel_hitl(
     """
     hitl_req = await _get_pending_request(thread_id, session)
     _check_hitl_authorization(hitl_req, current_user)
-    await _require_hitl_permission(current_user, "hitl_reject")
+    if not _is_playground_owner(hitl_req, current_user):
+        await _require_hitl_permission(current_user, "hitl_reject")
+    else:
+        logger.info(
+            f"[HITL] Playground owner cancel bypass for thread_id={thread_id!r}, "
+            f"user_id={current_user.id}"
+        )
 
     if hitl_req.status != HITLStatus.PENDING:
         raise HTTPException(
@@ -795,11 +1003,32 @@ def _check_hitl_authorization(hitl_req: HITLRequest, current_user) -> None:
     Playground requests (no assigned_to) remain accessible to the original
     creator.
     """
-    if hitl_req.assigned_to and hitl_req.assigned_to != current_user.id:
+    if hitl_req.assigned_to:
+        if hitl_req.assigned_to != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You are not assigned to this approval request",
+            )
+        return
+
+    # Playground runs (no assignee): only creator can act.
+    if (
+        not hitl_req.is_deployed_run
+        and hitl_req.user_id is not None
+        and hitl_req.user_id != current_user.id
+    ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="You are not assigned to this approval request",
+            detail="Only the flow owner can act on this playground HITL request",
         )
+
+
+def _is_playground_owner(hitl_req: HITLRequest, current_user) -> bool:
+    return (
+        not hitl_req.is_deployed_run
+        and hitl_req.user_id is not None
+        and hitl_req.user_id == current_user.id
+    )
 
 
 async def _require_hitl_permission(current_user, permission_key: str) -> None:
@@ -986,4 +1215,3 @@ def _resolve_request(
     req.decision = decision
     req.decided_by_user_id = decided_by
     req.decided_at = datetime.now(timezone.utc)
-

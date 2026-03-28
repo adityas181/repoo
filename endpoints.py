@@ -9,7 +9,7 @@ from collections.abc import AsyncGenerator
 from collections.abc import AsyncGenerator
 from enum import Enum
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, Any
 import uuid
 from uuid import UUID
 
@@ -20,7 +20,7 @@ from fastapi.responses import StreamingResponse
 from loguru import logger
 from sqlmodel import select
 
-from agentcore.api.utils import CurrentActiveUser, parse_value
+from agentcore.api.utils import CurrentActiveUser, DbSession, parse_value
 from agentcore.api.v1_schemas import (
     ConfigResponse,
     CustomComponentRequest,
@@ -259,6 +259,98 @@ async def _enforce_agent_api_key(
     return plaintext_key
 
 
+async def _run_hitl_resume_via_run_api(
+    *,
+    thread_id: str,
+    input_request: SimplifiedAPIRequest,
+    agent: Agent,
+    session,
+    acting_user_id: str | None,
+) -> dict[str, Any]:
+    """Internal-only HITL resume execution behind /api/run."""
+    from agentcore.api.human_in_loop import _execute_resume_locally
+    from agentcore.services.database.models.hitl_request.model import (
+        HITLRequest,
+        HITLResumeRequest,
+        HITLStatus,
+    )
+
+    if not input_request.hitl_action:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="hitl_action is required when hitl_resume_thread_id is set",
+        )
+
+    stmt = (
+        select(HITLRequest)
+        .where(HITLRequest.thread_id == thread_id)
+        .where(HITLRequest.status == HITLStatus.PENDING)
+        .order_by(HITLRequest.requested_at.desc())
+        .limit(1)
+    )
+    hitl_req = (await session.exec(stmt)).first()
+    if not hitl_req:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No pending HITL request found for thread_id='{thread_id}'",
+        )
+
+    if hitl_req.agent_id != agent.id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="HITL thread does not belong to the requested agent",
+        )
+
+    effective_user_id = acting_user_id or (
+        str(hitl_req.assigned_to) if hitl_req.assigned_to else str(hitl_req.user_id) if hitl_req.user_id else None
+    )
+    if not effective_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing acting user context for HITL resume",
+        )
+
+    try:
+        acting_user_uuid = UUID(str(effective_user_id))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid acting user id for HITL resume: {effective_user_id}",
+        ) from exc
+
+    acting_user = await session.get(User, acting_user_uuid)
+    if not acting_user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Acting user not found for HITL resume: {effective_user_id}",
+        )
+    if not acting_user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Acting user for HITL resume is inactive",
+        )
+
+    resume_body = HITLResumeRequest(
+        action=input_request.hitl_action,
+        feedback=input_request.hitl_feedback or "",
+        edited_value=input_request.hitl_edited_value or "",
+    )
+
+    logger.info(
+        f"[RUN_AGENT] Executing HITL resume via /run for thread_id={thread_id!r}, "
+        f"agent_id={agent.id}, user_id={acting_user.id}"
+    )
+    return await _execute_resume_locally(
+        thread_id=thread_id,
+        body=resume_body,
+        hitl_req=hitl_req,
+        current_user=acting_user,
+        session=session,
+        agent_payload=agent.data,
+        agent_name=agent.name,
+    )
+
+
 @router.get("/all", dependencies=[Depends(get_current_active_user)])
 async def get_all():
     """Retrieve all component types with compression for better performance.
@@ -351,12 +443,14 @@ async def simple_run_agent(
             graph.prod_deployment_id = str(prod_deployment.id)
             graph.prod_org_id = str(prod_deployment.org_id) if prod_deployment.org_id else None
             graph.prod_dept_id = str(prod_deployment.dept_id) if prod_deployment.dept_id else None
+            graph.prod_version_number = prod_deployment.version_number
 
         # Set UAT deployment context so adapter logs to transaction_uat
         if uat_deployment is not None:
             graph.uat_deployment_id = str(uat_deployment.id)
             graph.uat_org_id = str(uat_deployment.org_id) if uat_deployment.org_id else None
             graph.uat_dept_id = str(uat_deployment.dept_id) if uat_deployment.dept_id else None
+            graph.uat_version_number = uat_deployment.version_number
 
         # When called internally from orchestrator, skip node-level conversation persistence.
         # The orchestrator handles its own saving to orch_conversation.
@@ -552,6 +646,7 @@ async def run_agent_generator(
 async def simplified_run_agent(
     *,
     request: Request,
+    session: DbSession,
     agent_id_or_name: str,
     response: Response,
     background_tasks: BackgroundTasks,
@@ -561,6 +656,10 @@ async def simplified_run_agent(
     agent_api_key: Annotated[AgentApiKey | None, Depends(validate_agent_api_key)] = None,
     env: Annotated[RunEnvironment, Depends(_parse_env)] = RunEnvironment.DEV,
     version: str = Query(description="Version to run (e.g. 'v1', 'v2'). For env=dev this is ignored."),
+    hitl_resume_thread_id: str | None = Query(
+        default=None,
+        description="Internal-only: HITL thread_id to resume via /api/run routing",
+    ),
 ):
     """Executes a specified flow by ID with environment and version selection.
 
@@ -656,6 +755,23 @@ async def simplified_run_agent(
     _orch_org_id = request.headers.get("X-Orch-Org-Id") if _trust_orch_headers else None
     _orch_dept_id = request.headers.get("X-Orch-Dept-Id") if _trust_orch_headers else None
     _orch_user_id = request.headers.get("X-Orch-User-Id") if _trust_orch_headers else None
+
+    # Internal-only resume mode for HITL.
+    # This allows backend HITL approve to reuse /api/run routing (agent_id/env/version)
+    # so the request reaches the correct agent pod.
+    if hitl_resume_thread_id:
+        if not _is_internal:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="hitl_resume_thread_id is only allowed for internal calls",
+            )
+        return await _run_hitl_resume_via_run_api(
+            thread_id=hitl_resume_thread_id,
+            input_request=input_request,
+            agent=agent,
+            session=session,
+            acting_user_id=_orch_user_id,
+        )
 
     if not _is_internal:
         auto_generated_key = await _enforce_agent_api_key(agent_api_key, agent.id, env, deployment_id, version)
