@@ -638,6 +638,8 @@ export default function AgentOrchestrator() {
     let rafHandle: number | null = null;
     let pendingContent: string | null = null;
     let hitlPauseReceived = false;
+    let receivedToken = false;
+    let latestAgentAddMessageText = "";
 
     // Flush the latest accumulated content to React state.
     // Called inside a rAF so we update at most once per frame (~60fps),
@@ -771,14 +773,18 @@ export default function AgentOrchestrator() {
               });
             }
           } else if (eventType === "add_message" && (data?.text || data?.message) && !hitlPauseReceived) {
-            // Fallback for flows that emit plain add_message text instead of token chunks.
-            // Without this, the "Thinking..." bubble can go blank until DB polling catches up.
-            const finalText = String(data.text || data.message || "");
-            if (finalText.trim()) {
-              updateAgentMsg(finalText);
+            // Keep add_message text as a fallback, but don't immediately overwrite
+            // the thinking bubble. Some graphs emit user/input-node add_message
+            // events before AI tokens; rendering those here causes echo + no stream UX.
+            const sender = String(data?.sender || data?.sender_name || "").toLowerCase();
+            const isUserMessage = sender.includes("user");
+            const addMessageText = String(data.text || data.message || "");
+            if (!isUserMessage && addMessageText.trim()) {
+              latestAgentAddMessageText = addMessageText;
             }
           } else if (eventType === "token" && data?.chunk) {
             // Progressive streaming — append each token chunk (throttled)
+            receivedToken = true;
             accumulated += data.chunk;
             updateAgentMsg(accumulated);
           } else if (eventType === "error") {
@@ -790,6 +796,10 @@ export default function AgentOrchestrator() {
             // message with agent_text — the action buttons must stay visible.
             if (data?.agent_text && !hitlPauseReceived) {
               updateAgentMsg(data.agent_text, true);
+            } else if (!hitlPauseReceived && !receivedToken && latestAgentAddMessageText.trim()) {
+              // Fallback for non-token flows where response text came only via
+              // add_message and end has no agent_text payload.
+              updateAgentMsg(latestAgentAddMessageText, true);
             }
             // Mark content blocks as fully finished
             if (!hitlPauseReceived) {
@@ -833,6 +843,13 @@ export default function AgentOrchestrator() {
         setMessages((prev) =>
           prev.map((m) =>
             m.id === agentMsgId ? { ...m, content: finalContent } : m,
+          ),
+        );
+      } else if (!hitlPauseReceived && !receivedToken && latestAgentAddMessageText.trim()) {
+        // Defensive fallback if stream closes before we get a parsable end event.
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === agentMsgId ? { ...m, content: latestAgentAddMessageText } : m,
           ),
         );
       }
