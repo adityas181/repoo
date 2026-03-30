@@ -223,16 +223,37 @@ async def start_agent_build(
         the job_id.
     """
     job_id = str(uuid.uuid4())
+    redis_event_store = _get_build_event_store()
+    from agentcore.services.deps import get_rabbitmq_service
+    rabbitmq_service = get_rabbitmq_service()
+
     try:
+        # Distributed RabbitMQ path: use Redis as the cross-pod job/event registry.
+        # No local in-memory queue registration is required.
+        if rabbitmq_service.is_enabled() and redis_event_store is not None:
+            await redis_event_store.init_job(job_id)
+            job_data = {
+                "job_id": job_id,
+                "agent_id": str(agent_id),
+                "inputs": inputs.model_dump() if inputs else None,
+                "data": data.model_dump() if data else None,
+                "files": files,
+                "stop_component_id": stop_component_id,
+                "start_component_id": start_component_id,
+                "log_builds": log_builds,
+                "user_id": str(current_user.id),
+                "agent_name": agent_name,
+            }
+            await rabbitmq_service.publish_build_job(job_data)
+            logger.info(f"Build job {job_id} published to RabbitMQ (Redis backplane)")
+            return job_id
+
+        # Legacy in-memory path (direct or RabbitMQ without Redis).
         _, event_manager = queue_service.create_queue(job_id)
         # Gate that lets generate_agent_events() wait until the SSE consumer
-        # (GET /events) is connected before firing astream(). Prevents the
-        # first-message blank-chat issue caused by the fresh TCP connection
-        # delay (~100-400ms) on new browser sessions.
+        # (GET /events) is connected before firing astream().
         event_manager._consumer_ready = asyncio.Event()
 
-        # Mirror build events to Redis so /events can be served from any pod.
-        redis_event_store = _get_build_event_store()
         if redis_event_store is not None:
             try:
                 await redis_event_store.init_job(job_id)
@@ -240,10 +261,6 @@ async def start_agent_build(
             except Exception as redis_exc:  # noqa: BLE001
                 logger.warning(f"Failed to initialize Redis build-event mirror for {job_id}: {redis_exc}")
 
-        # --- RabbitMQ path (Option A) ---
-        from agentcore.services.deps import get_rabbitmq_service
-
-        rabbitmq_service = get_rabbitmq_service()
         if rabbitmq_service.is_enabled():
             job_data = {
                 "job_id": job_id,
@@ -257,9 +274,8 @@ async def start_agent_build(
                 "user_id": str(current_user.id),
                 "agent_name": agent_name,
             }
-            # Create a placeholder task so GET /events doesn't 404
-            # while waiting for the consumer to pick up the job.
-            # The consumer's _execute_build_job will replace this with the real task.
+            # Create a placeholder task so GET /events doesn't 404 while waiting
+            # for the RabbitMQ consumer to replace it with the real build task.
             placeholder_event = asyncio.Event()
             event_manager._job_ready = placeholder_event
 
@@ -268,9 +284,8 @@ async def start_agent_build(
 
             queue_service.start_job(job_id, _wait_for_consumer())
             await rabbitmq_service.publish_build_job(job_data)
-            logger.info(f"Build job {job_id} published to RabbitMQ")
+            logger.info(f"Build job {job_id} published to RabbitMQ (in-memory path)")
         else:
-            # --- Direct path (no RabbitMQ) ---
             task_coro = generate_agent_events(
                 agent_id=agent_id,
                 background_tasks=background_tasks,
@@ -286,13 +301,14 @@ async def start_agent_build(
             )
             queue_service.start_job(job_id, task_coro)
     except Exception as e:
-        if "redis_event_store" in locals() and redis_event_store is not None:
+        if redis_event_store is not None:
             try:
                 await redis_event_store.mark_status(job_id, status="failed", error=str(e))
             except Exception as redis_exc:  # noqa: BLE001
                 logger.debug(f"Could not mark Redis build job as failed for {job_id}: {redis_exc}")
         logger.exception("Failed to create queue and start task")
         raise HTTPException(status_code=500, detail=str(e)) from e
+
     return job_id
 
 
@@ -303,6 +319,20 @@ async def get_agent_events_response(
     event_delivery: EventDeliveryType,
 ):
     """Get events for a specific build job, either as a stream or single event."""
+    # In RabbitMQ mode with Redis enabled, always serve build events from Redis.
+    # This avoids cross-pod in-memory queue ownership races.
+    from agentcore.services.deps import get_rabbitmq_service
+    rabbitmq_service = get_rabbitmq_service()
+    event_store = _get_build_event_store()
+    if rabbitmq_service.is_enabled() and event_store is not None:
+        try:
+            if await event_store.job_exists(job_id):
+                if event_delivery in (EventDeliveryType.STREAMING, EventDeliveryType.DIRECT):
+                    return await _create_redis_events_response(job_id=job_id, event_store=event_store)
+                return await _get_redis_polling_response(job_id=job_id, event_store=event_store)
+        except Exception as redis_exc:  # noqa: BLE001
+            logger.warning(f"Redis-first build events lookup failed for job {job_id}: {redis_exc}")
+
     try:
         main_queue, event_manager, event_task, _ = queue_service.get_queue_data(job_id)
 

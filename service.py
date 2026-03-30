@@ -274,17 +274,35 @@ class RabbitMQService(Service):
         await self._safe_process(message, self.config.build_queue, self._handle_build)
 
     async def _handle_build(self, message: AbstractIncomingMessage, start_time: float) -> str:
-        from agentcore.services.deps import get_queue_service
+        from agentcore.events.event_manager import create_default_event_manager
+        from agentcore.services.deps import get_queue_service, get_settings_service
+        from agentcore.services.job_queue.redis_build_events import get_redis_job_event_store
 
         job_data = json.loads(message.body.decode("utf-8"))
         job_id = job_data["job_id"]
         logger.info(f"[RabbitMQ] Processing build job: {job_id}")
 
-        queue_service = get_queue_service()
+        # Distributed path: use Redis-backed job registry and event mirror so any pod
+        # can process the build message without stale in-memory ownership issues.
+        event_store = get_redis_job_event_store(get_settings_service(), namespace="build_events")
+        if event_store is not None:
+            try:
+                if not await event_store.job_exists(job_id):
+                    raise JobQueueNotFoundError(job_id)
+                event_manager = create_default_event_manager(asyncio.Queue())
+                event_manager.configure_redis_mirror(redis_store=event_store, job_id=job_id)
+            except JobQueueNotFoundError:
+                logger.warning(f"[RabbitMQ] Stale build job {job_id} - discarding (not in current session)")
+                await message.nack(requeue=False)
+                return job_id
 
-        # Stale message guard: job_id only exists in memory for this server session.
-        # If it's missing, this message is from a previous session that crashed while
-        # the job was UNACKED. Discard it immediately so the prefetch slot is freed.
+            await self._execute_build_job(job_data, event_manager, queue_service=None)
+            self._track(self.config.build_queue, "completed")
+            logger.info(f"[RabbitMQ] Build job completed: {job_id} ({time.time() - start_time:.2f}s)")
+            return job_id
+
+        # Legacy in-memory path (single-process ownership)
+        queue_service = get_queue_service()
         try:
             _, event_manager, _, _ = queue_service.get_queue_data(job_id)
         except JobQueueNotFoundError:
@@ -425,7 +443,12 @@ class RabbitMQService(Service):
     # Job executors
     # ------------------------------------------------------------------
 
-    async def _execute_build_job(self, job_data: dict[str, Any], event_manager: Any, queue_service: Any) -> None:
+    async def _execute_build_job(
+        self,
+        job_data: dict[str, Any],
+        event_manager: Any,
+        queue_service: Any | None,
+    ) -> None:
         from fastapi import BackgroundTasks
 
         from agentcore.api.build import generate_agent_events
@@ -461,9 +484,14 @@ class RabbitMQService(Service):
             current_user=current_user,
             agent_name=job_data.get("agent_name"),
         )
+        if queue_service is None:
+            # Distributed RabbitMQ path: run directly in this consumer process.
+            await task_coro
+            return
+
         queue_service.start_job(job_id, task_coro)
 
-        # Signal the placeholder task (if any) that the real job has started
+        # Signal the placeholder task (if any) that the real job has started.
         job_ready = getattr(event_manager, "_job_ready", None)
         if job_ready is not None:
             job_ready.set()
@@ -595,7 +623,6 @@ class RabbitMQService(Service):
                 orch_org_id=job_data.get("orch_org_id"),
                 orch_dept_id=job_data.get("orch_dept_id"),
                 orch_user_id=job_data.get("user_id"),
-                base_url_override=job_data.get("base_url"),
             )
 
             if was_interrupted:
