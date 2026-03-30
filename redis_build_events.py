@@ -18,10 +18,16 @@ class RedisBuildEventStore:
 
     TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 
-    def __init__(self, redis_client: StrictRedis, *, ttl_seconds: int = 900) -> None:
+    def __init__(
+        self,
+        redis_client: StrictRedis,
+        *,
+        ttl_seconds: int = 900,
+        namespace: str = "build_events",
+    ) -> None:
         self.redis = redis_client
         self.ttl_seconds = max(int(ttl_seconds or 900), 60)
-        self.prefix = "agentcore:build_events"
+        self.prefix = f"agentcore:{namespace}"
 
     def _events_key(self, job_id: str) -> str:
         return f"{self.prefix}:{job_id}:events"
@@ -94,19 +100,22 @@ class RedisBuildEventStore:
         return bool(await self.redis.exists(self._meta_key(job_id), self._events_key(job_id)))
 
 
-_store: RedisBuildEventStore | None = None
-_store_signature: tuple | None = None
+_stores: dict[tuple, RedisBuildEventStore] = {}
 
 
-def get_redis_build_event_store(settings_service: SettingsService) -> RedisBuildEventStore | None:
-    """Return a singleton RedisBuildEventStore when Redis cache is enabled."""
-    global _store, _store_signature
+def get_redis_job_event_store(
+    settings_service: SettingsService,
+    *,
+    namespace: str = "build_events",
+) -> RedisBuildEventStore | None:
+    """Return a singleton RedisBuildEventStore for the given namespace."""
 
     settings = settings_service.settings
     if settings.cache_type != "redis":
         return None
 
     signature = (
+        namespace,
         settings.redis_host,
         settings.redis_port,
         settings.redis_db,
@@ -115,16 +124,24 @@ def get_redis_build_event_store(settings_service: SettingsService) -> RedisBuild
         settings.redis_cache_expire,
     )
 
-    if _store is not None and _store_signature == signature:
-        return _store
+    if signature in _stores:
+        return _stores[signature]
 
     try:
         redis_client = get_redis_client(settings_service)
-        _store = RedisBuildEventStore(redis_client, ttl_seconds=settings.redis_cache_expire or 900)
-        _store_signature = signature
-        return _store
+        store = RedisBuildEventStore(
+            redis_client,
+            ttl_seconds=settings.redis_cache_expire or 900,
+            namespace=namespace,
+        )
+        _stores[signature] = store
+        return store
     except Exception as exc:  # noqa: BLE001
-        logger.warning(f"Redis build-event store unavailable: {exc}")
-        _store = None
-        _store_signature = None
+        logger.warning(f"Redis job-event store unavailable for namespace={namespace!r}: {exc}")
+        _stores.pop(signature, None)
         return None
+
+
+def get_redis_build_event_store(settings_service: SettingsService) -> RedisBuildEventStore | None:
+    """Return a singleton RedisBuildEventStore for build events."""
+    return get_redis_job_event_store(settings_service, namespace="build_events")

@@ -86,15 +86,15 @@ class RabbitMQService(Service):
             )
             logger.info("RabbitMQ connection established")
 
-            # Consumer channel — QoS applies to consumers on this channel
+            # Consumer channel - QoS applies to consumers on this channel
             self._channel = await self._connection.channel()
             await self._channel.set_qos(prefetch_count=self.config.prefetch_count)
 
-            # Separate publisher channel — no QoS, no consumers
+            # Separate publisher channel - no QoS, no consumers
             self._publish_channel = await self._connection.channel()
 
             # Orchestrator queue is only consumed by the main backend.
-            # AKS pods (AGENTCORE_IS_POD=true) must not subscribe to it — the
+            # AKS pods (AGENTCORE_IS_POD=true) must not subscribe to it - the
             # job_id is registered in the main backend's memory, so a pod picking
             # up the message would find nothing and discard it as stale.
             is_agent_pod = bool(os.environ.get("AGENTCORE_IS_POD"))
@@ -108,10 +108,10 @@ class RabbitMQService(Service):
             if not is_agent_pod:
                 queue_consumers.append((self.config.orchestrator_queue, self._on_orchestrator_message))
             else:
-                logger.info("Running as published agent pod — skipping orchestrator queue consumer")
+                logger.info("Running as published agent pod - skipping orchestrator queue consumer")
 
             for queue_name, handler in queue_consumers:
-                # Delete and redeclare — purge() only removes READY messages but
+                # Delete and redeclare - purge() only removes READY messages but
                 # leaves unacked messages from old connections alive until their
                 # heartbeat expires (up to 150s). Those re-queue AFTER purge and
                 # block the prefetch. Deleting + redeclaring gives a truly clean
@@ -241,7 +241,7 @@ class RabbitMQService(Service):
         queue_name: str,
         handler,
     ) -> None:
-        """Process a message safely — no exception can escape and kill the consumer.
+        """Process a message safely - no exception can escape and kill the consumer.
 
         The try/except wraps the ENTIRE message.process() context manager so that
         failures from message.ack() / message.reject() inside __aexit__ are also
@@ -288,13 +288,13 @@ class RabbitMQService(Service):
         try:
             _, event_manager, _, _ = queue_service.get_queue_data(job_id)
         except JobQueueNotFoundError:
-            logger.warning(f"[RabbitMQ] Stale build job {job_id} — discarding (not in current session)")
+            logger.warning(f"[RabbitMQ] Stale build job {job_id} - discarding (not in current session)")
             await message.nack(requeue=False)
             return job_id
 
         await self._execute_build_job(job_data, event_manager, queue_service)
 
-        # Keep message UNACKED until job completes — true RabbitMQ delivery guarantee.
+        # Keep message UNACKED until job completes - true RabbitMQ delivery guarantee.
         # Prefetch slot is held for the duration so rate-limiting (prefetch_count) works.
         _, _, task, _ = queue_service.get_queue_data(job_id)
         if task and not task.done():
@@ -319,7 +319,7 @@ class RabbitMQService(Service):
         try:
             _, event_manager, _, _ = queue_service.get_queue_data(job_id)
         except JobQueueNotFoundError:
-            logger.warning(f"[RabbitMQ] Stale run job {job_id} — discarding (not in current session)")
+            logger.warning(f"[RabbitMQ] Stale run job {job_id} - discarding (not in current session)")
             await message.nack(requeue=False)
             return job_id
 
@@ -386,25 +386,39 @@ class RabbitMQService(Service):
         await self._safe_process(message, self.config.orchestrator_queue, self._handle_orchestrator)
 
     async def _handle_orchestrator(self, message: AbstractIncomingMessage, start_time: float) -> str:
-        from agentcore.services.deps import get_queue_service
+        from agentcore.events.event_manager import create_default_event_manager
+        from agentcore.services.deps import get_settings_service
+        from agentcore.services.job_queue.redis_build_events import get_redis_job_event_store
 
         job_data = json.loads(message.body.decode("utf-8"))
         job_id = job_data["job_id"]
         logger.info(f"[RabbitMQ] Processing orchestrator job: {job_id}")
 
-        queue_service = get_queue_service()
-
-        try:
-            _, event_manager, _, _ = queue_service.get_queue_data(job_id)
-        except JobQueueNotFoundError:
-            logger.warning(f"[RabbitMQ] Stale orchestrator job {job_id} — discarding (not in current session)")
+        event_store = get_redis_job_event_store(get_settings_service(), namespace="orchestrator_events")
+        if event_store is None:
+            logger.error(f"[RabbitMQ] Orchestrator event store unavailable for job {job_id}")
             await message.nack(requeue=False)
             return job_id
 
-        await self._execute_orchestrator_job(job_data, event_manager)
+        try:
+            if not await event_store.job_exists(job_id):
+                raise JobQueueNotFoundError(job_id)
+            event_manager = create_default_event_manager(asyncio.Queue())
+            event_manager.configure_redis_mirror(redis_store=event_store, job_id=job_id)
+        except JobQueueNotFoundError:
+            logger.warning(f"[RabbitMQ] Stale orchestrator job {job_id} - discarding (not in current session)")
+            await message.nack(requeue=False)
+            return job_id
 
-        self._track(self.config.orchestrator_queue, "completed")
-        logger.info(f"[RabbitMQ] Orchestrator job completed: {job_id} ({time.time() - start_time:.2f}s)")
+        success = await self._execute_orchestrator_job(job_data, event_manager)
+        await event_manager.finalize_redis_mirror(status="completed" if success else "failed")
+
+        if success:
+            self._track(self.config.orchestrator_queue, "completed")
+            logger.info(f"[RabbitMQ] Orchestrator job completed: {job_id} ({time.time() - start_time:.2f}s)")
+        else:
+            self._track(self.config.orchestrator_queue, "failed")
+            logger.warning(f"[RabbitMQ] Orchestrator job failed: {job_id} ({time.time() - start_time:.2f}s)")
         return job_id
 
     # ------------------------------------------------------------------
@@ -496,7 +510,7 @@ class RabbitMQService(Service):
 
         if is_stream:
             # Streaming: run the agent directly with event_manager for token streaming.
-            # Do NOT use run_agent_generator here — it waits on a client_consumed_queue
+            # Do NOT use run_agent_generator here - it waits on a client_consumed_queue
             # that only the HTTP streaming response writes to.  In the RabbitMQ path the
             # HTTP response reads from the shared asyncio.Queue independently, so the
             # consumer must not block on client consumption.
@@ -545,7 +559,7 @@ class RabbitMQService(Service):
             finally:
                 event_manager.queue.put_nowait((None, None, time.time()))
 
-    async def _execute_orchestrator_job(self, job_data: dict[str, Any], event_manager: Any) -> None:
+    async def _execute_orchestrator_job(self, job_data: dict[str, Any], event_manager: Any) -> bool:
         # Get queue FIRST so the finally sentinel always works, even if imports fail
         queue = event_manager.queue
         job_id = job_data.get("job_id", "unknown")
@@ -565,7 +579,7 @@ class RabbitMQService(Service):
             agent_name = job_data["agent_name"]
             session_id = job_data["session_id"]
             user_id = uuid.UUID(job_data["user_id"])
-            deployment_id = uuid.UUID(job_data["deployment_id"])
+            deployment_id = uuid.UUID(job_data["deployment_id"]) if job_data.get("deployment_id") else None
 
             agent_text, was_interrupted, agent_content_blocks = await _orch_call_run_api(
                 agent_id=job_data["agent_id"],
@@ -576,16 +590,17 @@ class RabbitMQService(Service):
                 files=job_data.get("files"),
                 stream=True,
                 event_manager=event_manager,
-                orch_deployment_id=job_data.get("orch_deployment_id") or str(deployment_id),
+                orch_deployment_id=job_data.get("orch_deployment_id") or (str(deployment_id) if deployment_id else None),
                 orch_session_id=job_data.get("orch_session_id") or session_id,
                 orch_org_id=job_data.get("orch_org_id"),
                 orch_dept_id=job_data.get("orch_dept_id"),
                 orch_user_id=job_data.get("user_id"),
+                base_url_override=job_data.get("base_url"),
             )
 
             if was_interrupted:
                 event_manager.on_end(data={})
-                return
+                return True
 
             if not agent_text or not agent_text.strip():
                 agent_text = "Agent did not produce a response."
@@ -616,9 +631,12 @@ class RabbitMQService(Service):
                 "message_id": str(agent_msg.id),
                 "content_blocks": serialized_blocks,
             })
+            return True
         except Exception as exc:
             logger.exception(f"[RabbitMQ] Orchestrator job {job_id} error: {exc}")
             event_manager.on_error(data={"text": str(exc)})
             event_manager.on_end(data={})
+            return False
         finally:
             queue.put_nowait((None, None, None))
+
