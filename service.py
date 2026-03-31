@@ -20,6 +20,13 @@ if TYPE_CHECKING:
     from aio_pika.abc import AbstractRobustConnection
 
 
+def _env_flag(name: str, *, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 class RabbitMQService(Service):
     """RabbitMQ service for durable job scheduling with rate limiting.
 
@@ -60,9 +67,6 @@ class RabbitMQService(Service):
         """Connect to RabbitMQ, declare queues, and start consumers.
 
         Uses a single channel for all queues (CloudAMQP compatibility).
-        Old messages from previous server runs are purged on startup since
-        the in-memory job queues (EventManager, asyncio.Queue) are ephemeral
-        and old job_ids cannot be processed.
         """
         if not self.config.enabled:
             logger.info("RabbitMQ is disabled (RABBITMQ_ENABLED != true). Skipping.")
@@ -97,7 +101,7 @@ class RabbitMQService(Service):
             # AKS pods (AGENTCORE_IS_POD=true) must not subscribe to it - the
             # job_id is registered in the main backend's memory, so a pod picking
             # up the message would find nothing and discard it as stale.
-            is_agent_pod = bool(os.environ.get("AGENTCORE_IS_POD"))
+            is_agent_pod = _env_flag("AGENTCORE_IS_POD")
 
             queue_consumers = [
                 (self.config.build_queue, self._on_build_message),
@@ -111,19 +115,11 @@ class RabbitMQService(Service):
                 logger.info("Running as published agent pod - skipping orchestrator queue consumer")
 
             for queue_name, handler in queue_consumers:
-                # Delete and redeclare - purge() only removes READY messages but
-                # leaves unacked messages from old connections alive until their
-                # heartbeat expires (up to 150s). Those re-queue AFTER purge and
-                # block the prefetch. Deleting + redeclaring gives a truly clean
-                # slate; when old connections close, re-queued messages arrive at
-                # the new queue and the handlers discard them as stale instantly.
-                try:
-                    await self._channel.queue_delete(queue_name)
-                    logger.info(f"Deleted existing queue {queue_name} for clean startup")
-                except Exception:
-                    pass
+                # Multi-pod safety: never delete shared queues during startup.
+                # Deleting removes peers' consumers and makes the last pod that
+                # redeclares effectively process all jobs.
                 q = await self._channel.declare_queue(queue_name, durable=True)
-                logger.info(f"Declared fresh queue {queue_name}")
+                logger.info(f"Declared queue {queue_name}")
 
                 self._queues[queue_name] = q
                 tag = await q.consume(handler)
@@ -626,6 +622,66 @@ class RabbitMQService(Service):
             )
 
             if was_interrupted:
+                # Keep HITL pause visible after page reload:
+                # stream event is transient, but orch page refetches messages from DB.
+                # Persist a HITL message row so the action/status UI can recover.
+                try:
+                    from sqlmodel import col, select as _sel
+
+                    from agentcore.services.database.models.hitl_request.model import (
+                        HITLRequest,
+                        HITLStatus,
+                    )
+
+                    actions: list[str] = []
+                    question = "Awaiting human review"
+                    async with session_scope() as db:
+                        stmt = (
+                            _sel(HITLRequest)
+                            .where(HITLRequest.session_id == session_id)
+                            .where(HITLRequest.status == HITLStatus.PENDING)
+                            .order_by(col(HITLRequest.requested_at).desc())
+                            .limit(1)
+                        )
+                        hitl_row = (await db.exec(stmt)).first()
+                        if hitl_row and hitl_row.interrupt_data:
+                            idata = hitl_row.interrupt_data
+                            actions = idata.get("actions", [])
+                            question = idata.get("question", question)
+
+                    actions_display = "\n".join(f"- {a}" for a in actions) if actions else "-"
+                    hitl_text = (
+                        "Waiting for human review\n\n"
+                        f"{question}\n\n"
+                        "Available actions:\n"
+                        f"{actions_display}"
+                    )
+
+                    hitl_ts = datetime.now(timezone.utc).replace(tzinfo=None)
+                    async with session_scope() as db:
+                        hitl_msg = OrchConversationTable(
+                            id=uuid.uuid4(),
+                            sender="agent",
+                            sender_name=agent_name,
+                            session_id=session_id,
+                            text=hitl_text,
+                            agent_id=agent_id,
+                            user_id=user_id,
+                            deployment_id=deployment_id,
+                            timestamp=hitl_ts,
+                            files=[],
+                            properties={
+                                "hitl": True,
+                                "thread_id": session_id,
+                                "actions": actions,
+                                "is_deployed_run": True,
+                            },
+                            category="message",
+                            content_blocks=[],
+                        )
+                        await orch_add_message(hitl_msg, db)
+                except Exception as hitl_exc:
+                    logger.warning(f"[RabbitMQ] Could not persist HITL pause message for {job_id}: {hitl_exc}")
                 event_manager.on_end(data={})
                 return True
 
@@ -666,4 +722,3 @@ class RabbitMQService(Service):
             return False
         finally:
             queue.put_nowait((None, None, None))
-
