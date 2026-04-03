@@ -121,8 +121,11 @@ class Settings(BaseSettings):
     redis_host: str = os.getenv("REDIS_HOST")
     redis_port: int =os.getenv("REDIS_PORT")
     redis_db: int = 0
-    redis_url: str | None = None
-    redis_password: str =os.getenv("REDIS_PASSWORD")
+    redis_entra_scope: str = os.getenv("REDIS_ENTRA_SCOPE", "")
+    redis_entra_object_id: str = os.getenv("REDIS_ENTRA_OBJECT_ID", "")
+    redis_entra_refresh_margin_seconds: int = int(
+        os.getenv("REDIS_ENTRA_REFRESH_MARGIN_SECONDS", "180")
+    )
     redis_ssl: bool = os.getenv("REDIS_SSL")
     cache_expire: int = os.getenv("REDIS_CACHE_EXPIRE")
     redis_cache_expire: int = os.getenv("REDIS_CACHE_EXPIRE")
@@ -190,6 +193,10 @@ class Settings(BaseSettings):
     """Pinecone index name for semantic search vectors."""
     semantic_search_embedding_dimensions: int = 1536
     """Embedding dimensions for semantic search (text-embedding-3-small default: 1536)."""
+    semantic_search_min_score: float = 0.35
+    """Minimum cosine similarity score (0.0-1.0) to return a semantic search result. Results below this threshold are filtered out."""
+    semantic_search_use_reranking: bool = False
+    """Enable Pinecone reranking (pinecone-rerank-v0) for semantic search. Requires a paid Pinecone plan."""
 
     """The cache expire in seconds."""
     # [VARIABLE REMOVED] variable_store setting removed — migrating to Azure Key Vault
@@ -205,8 +212,9 @@ class Settings(BaseSettings):
     # redis_host: str = "agentcoreredis.redis.cache.windows.net"
     # redis_port: int = 6380
     # redis_db: int = 0
-    # redis_url: str | None = None
-    # redis_password: str | None = "7iQsiMysElkfTwCNsyAuiQng3Eeeat6jFAzCaCPfsQw="
+    # redis_entra_scope: str = "https://redis.azure.com/.default"
+    # redis_entra_object_id: str = ""
+    # redis_entra_refresh_margin_seconds: int = 180
     # redis_cache_expire: int = 3600
 
 
